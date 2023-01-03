@@ -18,12 +18,13 @@ an implementation detail of the server.
 
 ## Conventions
 
-In the below protocol descriptions, the label 'C:' is used for messages
-sent by the client, whereas 'S:' is used for messages sent by the
-server).  `monotype text` is for literal character data or (when used in
-comments) constant names, `0xdeadbeef` is used for literal hex numbers
-(which are always sent in network byte order), and (brackets) are used
-for comments. Anything else is a description of the data that is sent.
+In the below protocol descriptions, the label 'C:' is used for
+messages sent by the client, whereas 'S:' is used for messages sent by
+the server).  `monotype text` is for literal character data or (when
+used in comments) constant names, `0xdeadbeef` is used for literal hex
+numbers (which are always sent in big-endian network byte order), and
+(brackets) are used for comments. Anything else is a description of
+the data that is sent.
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL",
 "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED",
@@ -374,13 +375,15 @@ S: (*length* bytes of data if the request is of type `NBD_CMD_READ` and
 Some of the major downsides of the default simple reply to
 `NBD_CMD_READ` are as follows.  First, it is not possible to support
 partial reads or early errors (the command must succeed or fail as a
-whole, and either *length* bytes of data must be sent or a hard disconnect
-must be initiated, even if the failure is `NBD_EINVAL` due to bad flags).
-Second, there is no way to efficiently skip over portions of a sparse
-file that are known to contain all zeroes.  Finally, it is not
-possible to reliably decode the server traffic without also having
-context of what pending read requests were sent by the client.
-Therefore structured replies are also permitted if negotiated.
+whole; no payload is sent if *error* was set, but if *error* is zero
+and a later error is detected before *length* bytes are returned, the
+server must initiate a hard disconnect).  Second, there is no way to
+efficiently skip over portions of a sparse file that are known to
+contain all zeroes.  Finally, it is not possible to reliably decode
+the server traffic without also having context of what pending read
+requests were sent by the client, to see which *handle* values will
+have accompanying payload on success.  Therefore structured replies
+are also permitted if negotiated.
 
 A structured reply in the transmission phase consists of one or
 more structured reply chunk messages.  The server MUST NOT send
@@ -882,15 +885,25 @@ The procedure works as follows:
   server supports.
 - During transmission, a client can then indicate interest in metadata
   for a given region by way of the `NBD_CMD_BLOCK_STATUS` command,
-  where *offset* and *length* indicate the area of interest. The
-  server MUST then respond with the requested information, for all
-  contexts which were selected during negotiation. For every metadata
-  context, the server sends one set of extent chunks, where the sizes
-  of the extents MUST be less than or equal to the length as specified
-  in the request. Each extent comes with a *flags* field, the
-  semantics of which are defined by the metadata context.
-- A server MUST reply to `NBD_CMD_BLOCK_STATUS` with a structured
-  reply of type `NBD_REPLY_TYPE_BLOCK_STATUS`.
+  where *offset* and *length* indicate the area of interest. On
+  success, the server MUST respond with one structured reply chunk of
+  type `NBD_REPLY_TYPE_BLOCK_STATUS` per metadata context selected
+  during negotiation, where each reply chunk is a list of one or more
+  consecutive extents for that context.  Each extent comes with a
+  *flags* field, the semantics of which are defined by the metadata
+  context.
+
+The client's requested *length* is only a hint to the server, so the
+cumulative extent length contained in a chunk of the server's reply
+may be shorter or longer the original request.  When more than one
+metadata context was negotiated, the reply chunks for the different
+contexts of a single block status request need not have the same
+number of extents or cumulative extent length.
+
+In the request, the client may use the `NBD_CMD_FLAG_REQ_ONE` command
+flag to further constrain the server's reply so that each chunk
+contains exactly one extent whose length does not exceed the client's
+original *length*.
 
 A client MUST NOT use `NBD_CMD_BLOCK_STATUS` unless it selected a
 nonzero number of metadata contexts during negotiation, and used the
@@ -1778,8 +1791,8 @@ MUST initiate a hard disconnect.
   *length* MUST be 4 + (a positive integer multiple of 8).  This reply
   represents a series of consecutive block descriptors where the sum
   of the length fields within the descriptors is subject to further
-  constraints documented below. This chunk type MUST appear
-  exactly once per metadata ID in a structured reply.
+  constraints documented below.  A successful block status request MUST
+  have exactly one status chunk per negotiated metadata context ID.
 
   The payload starts with:
 
@@ -1801,15 +1814,19 @@ MUST initiate a hard disconnect.
   *length* of the final extent MAY result in a sum larger than the
   original requested length, if the server has that information anyway
   as a side effect of reporting the status of the requested region.
+  When multiple metadata contexts are negotiated, the reply chunks for
+  the different contexts need not have the same number of extents or
+  cumulative extent length.
 
   Even if the client did not use the `NBD_CMD_FLAG_REQ_ONE` flag in
   its request, the server MAY return fewer descriptors in the reply
   than would be required to fully specify the whole range of requested
   information to the client, if looking up the information would be
   too resource-intensive for the server, so long as at least one
-  extent is returned. Servers should however be aware that most
-  clients implementations will then simply ask for the next extent
-  instead.
+  extent is returned.  Servers should however be aware that most
+  client implementations will likely follow up with a request for
+  extent information at the first offset not covered by a
+  reduced-length reply.
 
 All error chunk types have bit 15 set, and begin with the same
 *error*, *message length*, and optional *message* fields as
@@ -1824,7 +1841,9 @@ remaining structured fields at the end.
   be at least 6.  This chunk represents that an error occurred,
   and the client MAY NOT make any assumptions about partial
   success. This type SHOULD NOT be used more than once in a
-  structured reply.  Valid as a reply to any request.
+  structured reply.  Valid as a reply to any request.  Note that
+  *message length* MUST NOT exceed the 4096 bytes string length
+  limit.
 
   The payload is structured as:
 
@@ -1845,7 +1864,8 @@ remaining structured fields at the end.
   were sent earlier in the structured reply, the server SHOULD NOT
   send multiple distinct offsets that lie within the bounds of a
   single content chunk.  Valid as a reply to `NBD_CMD_READ`,
-  `NBD_CMD_WRITE`, `NBD_CMD_TRIM`, and `NBD_CMD_BLOCK_STATUS`.
+  `NBD_CMD_WRITE`, `NBD_CMD_TRIM`, `NBD_CMD_CACHE`,
+  `NBD_CMD_WRITE_ZEROES`, and `NBD_CMD_BLOCK_STATUS`.
 
   The payload is structured as:
 
@@ -1909,13 +1929,14 @@ The following request types exist:
     chunks that describe data outside the offset and length of the
     request, but MAY send the content chunks in any order (the client
     MUST reassemble content chunks into the correct order), and MAY
-    send additional content chunks even after reporting an error chunk.
-    Note that a request for more than 2^32 - 8 bytes MUST be split
-    into at least two chunks, so as not to overflow the length field
-    of a reply while still allowing space for the offset of each
-    chunk.  When no error is detected, the server MUST send enough
-    data chunks to cover the entire region described by the offset and
-    length of the client's request.
+    send additional content chunks even after reporting an error
+    chunk.  Note that a request for more than 2^32 - 8 bytes (if
+    permitted by block size constraints) MUST be split into at least
+    two chunks, so as not to overflow the length field of a reply
+    while still allowing space for the offset of each chunk.  When no
+    error is detected, the server MUST send enough data chunks to
+    cover the entire region described by the offset and length of the
+    client's request.
 
     To minimize traffic, the server MAY use a content or error chunk
     as the final chunk by setting the `NBD_REPLY_FLAG_DONE` flag, but
@@ -2323,7 +2344,7 @@ considered a baseline:
     - the `NBD_OPT_INFO` and `NBD_OPT_GO` messages, with the
       `NBD_INFO_EXPORT` response.
     - Servers that receive messages which they do not implement MUST
-      reply to them with `NBD_OPT_UNSUP`, and MUST NOT fail to parse
+      reply to them with `NBD_REP_ERR_UNSUP`, and MUST NOT fail to parse
       the next message received.
     - the `NBD_OPT_ABORT` message, and its response.
     - the `NBD_OPT_LIST` message and its response.
