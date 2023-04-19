@@ -294,20 +294,22 @@ replies, and that it is impossible to tell by reading the server
 traffic in isolation whether a data field will be present; the simple
 reply is also problematic for error handling of the `NBD_CMD_READ`
 request.  Therefore, structured replies can be used to create a
-a context-free server stream; see below.
+context-free server stream; see below.
 
 Replies need not be sent in the same order as requests (i.e., requests
 may be handled by the server asynchronously), and structured reply
 chunks from one request may be interleaved with reply messages from
 other requests; however, there may be constraints that prevent
 arbitrary reordering of structured reply chunks within a given reply.
-Clients SHOULD use a handle that is distinct from all other currently
-pending transactions, but MAY reuse handles that are no longer in
-flight; handles need not be consecutive.  In each reply message
+Clients SHOULD use a cookie that is distinct from all other currently
+pending transactions, but MAY reuse cookies that are no longer in
+flight; cookies need not be consecutive.  In each reply message
 (whether simple or structured), the server MUST use the same value for
-handle as was sent by the client in the corresponding request.  In
-this way, the client can correlate which request is receiving a
-response.
+cookie as was sent by the client in the corresponding request,
+treating the cookie as an opaque field.  In this way, the client can
+correlate which request is receiving a response.  Note that earlier
+versions of this specification referred to a client's cookie as a
+handle.
 
 #### Ordering of messages and writes
 
@@ -349,7 +351,7 @@ The request message, sent by the client, looks as follows:
 C: 32 bits, 0x25609513, magic (`NBD_REQUEST_MAGIC`)  
 C: 16 bits, command flags  
 C: 16 bits, type  
-C: 64 bits, handle  
+C: 64 bits, cookie  
 C: 64 bits, offset (unsigned)  
 C: 32 bits, length (unsigned)  
 C: (*length* bytes of data if the request is of type `NBD_CMD_WRITE`)  
@@ -366,7 +368,7 @@ follows:
 S: 32 bits, 0x67446698, magic (`NBD_SIMPLE_REPLY_MAGIC`; used to be
    `NBD_REPLY_MAGIC`)  
 S: 32 bits, error (MAY be zero)  
-S: 64 bits, handle  
+S: 64 bits, cookie  
 S: (*length* bytes of data if the request is of type `NBD_CMD_READ` and
     *error* is zero)  
 
@@ -378,10 +380,10 @@ partial reads or early errors (the command must succeed or fail as a
 whole; no payload is sent if *error* was set, but if *error* is zero
 and a later error is detected before *length* bytes are returned, the
 server must initiate a hard disconnect).  Second, there is no way to
-efficiently skip over portions of a sparse file that are known to
+efficiently skip over portions of a sparse export that is known to
 contain all zeroes.  Finally, it is not possible to reliably decode
 the server traffic without also having context of what pending read
-requests were sent by the client, to see which *handle* values will
+requests were sent by the client, to see which *cookie* values will
 have accompanying payload on success.  Therefore structured replies
 are also permitted if negotiated.
 
@@ -398,7 +400,7 @@ sending errors via a structured reply, as the error can then be
 accompanied by a string payload to present to a human user.
 
 A structured reply MAY occupy multiple structured chunk messages
-(all with the same value for "handle"), and the
+(all with the same value for "cookie"), and the
 `NBD_REPLY_FLAG_DONE` reply flag is used to identify the final
 chunk.  Unless further documented by individual requests below,
 the chunks MAY be sent in any order, except that the chunk with
@@ -418,7 +420,7 @@ A structured reply chunk message looks as follows:
 S: 32 bits, 0x668e33ef, magic (`NBD_STRUCTURED_REPLY_MAGIC`)  
 S: 16 bits, flags  
 S: 16 bits, type  
-S: 64 bits, handle  
+S: 64 bits, cookie  
 S: 32 bits, length of payload (unsigned)  
 S: *length* bytes of payload data (if *length* is nonzero)  
 
@@ -464,7 +466,7 @@ of disconnect other than in one of the above circumstances.
 #### Reserved Magic values
 
 The following magic values are reserved and must not be used
-for future protocol extentions:
+for future protocol extensions:
 
 0x12560953 - Historic value for NBD_REQUEST_MAGIC, used
 	     until Linux 2.1.116pre2.
@@ -935,7 +937,7 @@ Namespaces MUST be consist of one of the following:
 Third-party implementations can register additional namespaces by
 simple request to the mailing-list. The following additional
 third-party namespaces are currently registered:
-* `qemu`, maintained by [qemu.org](https://git.qemu.org/?p=qemu.git;a=blob;f=docs/interop/nbd.txt)
+* `qemu`, maintained by [qemu.org](https://gitlab.com/qemu-project/qemu/-/blob/master/docs/interop/nbd.txt)
 
 Save in respect of the `base:` namespace described below, this specification
 requires no specific semantics of metadata contexts, except that all the
@@ -1302,7 +1304,7 @@ of the newstyle negotiation.
 
     Other errors (such as `NBD_REP_ERR_SHUTDOWN`) are also possible,
     as permitted elsewhere in this document, with no constraints on
-    the number of preceeding `NBD_REP_INFO`.
+    the number of preceding `NBD_REP_INFO`.
 
     If there are no intervening option requests between a successful
     `NBD_OPT_INFO` (that is, one where the reply ended with a final
@@ -1709,7 +1711,7 @@ valid may depend on negotiation during the handshake phase.
   `NBD_CMD_BLOCK_STATUS`. If set, the client is interested in only one
   extent per metadata context. If this flag is present, the server
   MUST NOT send metadata on more than one extent in the reply. Client
-  implementors should note that using this flag on multiple contiguous
+  implementers should note that using this flag on multiple contiguous
   requests is likely to be inefficient.
 - bit 4, `NBD_CMD_FLAG_FAST_ZERO`; valid during
   `NBD_CMD_WRITE_ZEROES`. If set, but the server cannot perform the
@@ -1758,7 +1760,7 @@ MUST initiate a hard disconnect.
 
   This chunk type is in the content chunk category.  *length* MUST be
   at least 9.  It represents the contents of *length - 8* bytes of the
-  file, starting at the absolute *offset* from the start of the
+  export, starting at the absolute *offset* from the start of the
   export.  The data MUST lie within the bounds of the original offset
   and length of the client's request, and MUST NOT overlap with the
   bounds of any earlier content chunk or error chunk in the same
@@ -2178,7 +2180,7 @@ The following request types exist:
 
     The list of block status descriptors within the
     `NBD_REPLY_TYPE_BLOCK_STATUS` chunk represent consecutive portions
-    of the file starting from specified *offset*.  If the client used
+    of the export starting from specified *offset*.  If the client used
     the `NBD_CMD_FLAG_REQ_ONE` flag, each chunk contains exactly one
     descriptor where the *length* of the descriptor MUST NOT be greater
     than the *length* of the request; otherwise, a chunk MAY contain
@@ -2204,10 +2206,10 @@ The following request types exist:
     If an error occurs, the server SHOULD set the appropriate error
     code in the error field of an error chunk. However, if the error
     does not involve invalid usage (such as a request beyond the
-    bounds of the file), a server MAY reply with a single block status
-    descriptor with *length* matching the requested length, rather
-    than reporting the error; in this case the context MAY mandate the
-    status returned.
+    bounds of the export), a server MAY reply with a single block
+    status descriptor with *length* matching the requested length,
+    rather than reporting the error; in this case the context MAY
+    mandate the status returned.
 
     A client MAY initiate a hard disconnect if it detects that the
     server has sent an invalid chunk. The server SHOULD return
@@ -2302,7 +2304,7 @@ Currently known are:
 
 * The `RESIZE` [extension](https://github.com/NetworkBlockDevice/nbd/blob/extension-resize/doc/proto.md).
 
-Implementors of these extensions are strongly suggested to contact the
+Implementers of these extensions are strongly suggested to contact the
 [mailinglist](mailto:nbd@other.debian.org) in order to help
 fine-tune the specifications before committing to a particular
 implementation.
@@ -2322,7 +2324,7 @@ options. While the basic protocol is still reasonably simple, a growing
 number of extensions has been implemented that may make the protocol
 description seem overwhelming at first.
 
-In an effort to not overwhelm first-time implementors with various
+In an effort to not overwhelm first-time implementers with various
 options and features that may or may not be important for their use
 case, while at the same time desiring maximum interoperability, this
 section tries to clarify what is optional and what is expected to be
